@@ -1,4 +1,5 @@
-# pip install pandas numpy sentence-transformers chromadb sklearn scipy matplotlib seaborn umap-learn evidently
+# pip install pandas numpy sentence-transformers chromadb sklearn scipy matplotlib seaborn umap-learn evidently alibi-detect
+
 
 import pandas as pd
 import numpy as np
