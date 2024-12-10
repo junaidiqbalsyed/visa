@@ -1,9 +1,8 @@
 import os
 import logging
-import torch
 from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModel
 from tqdm import tqdm
+from sentence_transformers import SentenceTransformer
 import chromadb
 from chromadb.utils import embedding_functions
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
@@ -46,35 +45,30 @@ class MerchantDataset(Dataset):
         return mrch_nm_raw, metadata
 
 # -------------------------
-# 2. Embedding Model Class with bfloat16 and BitsAndBytes
+# 2. SentenceTransformer Model Class
 # -------------------------
 class EmbeddingModel:
     def __init__(self, model_path="model/all-MiniLM-L6-v2"):
+        """
+        Load SentenceTransformer model from local path.
+        """
         try:
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-            self.dtype = torch.bfloat16  # Use bfloat16 precision for better performance
-            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-
-            # Load model with bfloat16 precision and BitsAndBytes quantization
-            self.model = AutoModel.from_pretrained(
-                model_path,
-                torch_dtype=self.dtype,
-                load_in_8bit=True,  # BitsAndBytes quantization
-                device_map="auto"  # Automatically map to GPUs
-            )
-            logger.info(f"Embedding model loaded successfully from {model_path} with bfloat16 precision.")
+            self.model = SentenceTransformer(model_path, device="cuda" if torch.cuda.is_available() else "cpu")
+            logger.info(f"Embedding model loaded successfully from path: {model_path}")
         except Exception as e:
-            logger.error(f"Failed to load embedding model from {model_path}: {str(e)}")
+            logger.error(f"Error loading SentenceTransformer model: {str(e)}")
             raise
 
     def generate_embeddings(self, texts):
         """
-        Generate embeddings for a batch of input texts.
+        Generate embeddings using the SentenceTransformer model.
         """
-        inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            outputs = self.model(**inputs).last_hidden_state[:, 0, :]
-        return outputs.cpu().numpy()
+        try:
+            embeddings = self.model.encode(texts, batch_size=256, show_progress_bar=False, normalize_embeddings=True)
+            return embeddings
+        except Exception as e:
+            logger.error(f"Error generating embeddings: {str(e)}")
+            raise
 
 # -------------------------
 # 3. Chroma DB Setup with Persistence
@@ -90,20 +84,26 @@ def setup_chroma_db(embedding_name="v1"):
 
 def insert_to_chroma_db(collection, embeddings, metadata_list):
     ids = [str(i) for i in range(len(metadata_list))]
-    collection.add(embeddings=embeddings, metadatas=metadata_list, ids=ids)
+    collection.add(embeddings=embeddings.tolist(), metadatas=metadata_list, ids=ids)
     logger.info(f"Inserted batch of {len(metadata_list)} embeddings into Chroma DB.")
 
 # -------------------------
 # 4. Batch Processing with Multi-Processing
 # -------------------------
 def process_batch(batch, embedding_model, chroma_collection):
+    """
+    Function to process each batch: generate embeddings and store in Chroma DB.
+    """
     start_time = time()
     raw_names, metadata_list = zip(*batch)
-    embeddings = embedding_model.generate_embeddings(raw_names)
+    embeddings = embedding_model.generate_embeddings(list(raw_names))
     insert_to_chroma_db(chroma_collection, embeddings, metadata_list)
     logger.info(f"Processed batch of {len(batch)} in {time() - start_time:.2f} seconds.")
 
 def process_data(file_path, embedding_model, chroma_collection, batch_size=1024, num_workers=4):
+    """
+    Process the entire dataset in batches with multiprocessing for embedding generation.
+    """
     dataset = MerchantDataset(file_path)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
@@ -121,7 +121,7 @@ def main():
         embedding_name = "v1"  # Embedding version name
 
         # Initialize Embedding Model
-        embedding_model = EmbeddingModel()
+        embedding_model = EmbeddingModel(model_path="model/all-MiniLM-L6-v2")
 
         # Setup Chroma DB with persistence
         chroma_collection = setup_chroma_db(embedding_name)
