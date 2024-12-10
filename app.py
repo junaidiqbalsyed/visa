@@ -1,138 +1,232 @@
-import os
-import logging
-from torch.utils.data import Dataset, DataLoader
-from tqdm import tqdm
+# pip install pandas numpy sentence-transformers chromadb sklearn scipy matplotlib seaborn umap-learn evidently
+
+import pandas as pd
+import numpy as np
 from sentence_transformers import SentenceTransformer
-import chromadb
-from chromadb.utils import embedding_functions
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
-from time import time
+from chromadb import Client
+from chromadb.config import Settings
+from sklearn.decomposition import PCA
+from scipy.spatial import distance
+from scipy.stats import entropy, wasserstein_distance
+from numpy.linalg import inv
+import matplotlib.pyplot as plt
+import seaborn as sns
+import umap.umap_ as umap
+from evidently.report import Report
+from evidently.metric_preset import DataDriftPreset
+from alibi_detect.cd import MMDDrift
 
-# -------------------------
-# Logger Setup
-# -------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("drift_detection.log")]
+###############################################################################
+# Create sample dataset
+###############################################################################
+# Replace this with loading your own dataset (e.g., df = pd.read_csv("your_data.csv"))
+df = pd.DataFrame({
+    "mrch_nm_raw": [
+        "SAFEWAY #2841",
+        "SHELL OIL 1000492406",
+        "SUNOCO 091017800",
+        "POPEYES 11562",
+        "TEXAS ROADHOUSE FR #7005",
+        "HARBOR FREIGHT TOOLS 233",
+        "COSTCO WHOLESALE",
+        "WALMART SUPERCENTER 1234",
+        "TARGET T-123",
+        "AMAZON MKTPLACE PMTS",
+        "MCDONALD'S F23987",
+        "BURGER KING #0081"
+    ]
+})
+
+# Split into old and new sets for demonstration
+mid = len(df)//2
+old_df = df.iloc[:mid]
+new_df = df.iloc[mid:]
+
+###############################################################################
+# Embedding Model
+###############################################################################
+model_name = "sentence-transformers/all-mpnet-base-v2"
+model = SentenceTransformer(model_name)
+
+old_embeddings = model.encode(old_df["mrch_nm_raw"].tolist(), convert_to_numpy=True)
+new_embeddings = model.encode(new_df["mrch_nm_raw"].tolist(), convert_to_numpy=True)
+
+###############################################################################
+# Store embeddings in Chroma DB
+###############################################################################
+client = Client(
+    Settings(
+        chroma_db_impl="duckdb+parquet",
+        persist_directory="chroma_db"
+    )
 )
-logger = logging.getLogger(__name__)
 
-# -------------------------
-# 1. Custom PyTorch Dataset
-# -------------------------
-class MerchantDataset(Dataset):
-    """
-    PyTorch Dataset to read merchant data directly from a CSV file.
-    """
-    def __init__(self, file_path):
-        self.file_path = file_path
-        self.lines = self._load_data()
+collection = client.get_or_create_collection(name="merchant_embeddings")
 
-    def _load_data(self):
-        with open(self.file_path, "r") as file:
-            data = file.readlines()[1:]  # Skip header
-        logger.info(f"Loaded {len(data)} rows from {self.file_path}.")
-        return data
+collection.add(
+    documents=old_df["mrch_nm_raw"].tolist(),
+    embeddings=old_embeddings.tolist(),
+    ids=[f"old_{i}" for i in range(len(old_df))]
+)
 
-    def __len__(self):
-        return len(self.lines)
+collection.add(
+    documents=new_df["mrch_nm_raw"].tolist(),
+    embeddings=new_embeddings.tolist(),
+    ids=[f"new_{i}" for i in range(len(new_df))]
+)
 
-    def __getitem__(self, idx):
-        row = self.lines[idx].strip().split(",")
-        mrch_nm_raw = row[0]  # Assuming the first column is 'mrch_nm_raw'
-        metadata = {"row": row[1:]}  # Remaining columns as metadata
-        return mrch_nm_raw, metadata
+###############################################################################
+# Compute Drift Metrics (Traditional Methods)
+###############################################################################
+old_centroid = np.mean(old_embeddings, axis=0)
+new_centroid = np.mean(new_embeddings, axis=0)
 
-# -------------------------
-# 2. SentenceTransformer Model Class
-# -------------------------
-class EmbeddingModel:
-    def __init__(self, model_path="model/all-MiniLM-L6-v2"):
-        """
-        Load SentenceTransformer model from local path.
-        """
-        try:
-            self.model = SentenceTransformer(model_path, device="cuda" if torch.cuda.is_available() else "cpu")
-            logger.info(f"Embedding model loaded successfully from path: {model_path}")
-        except Exception as e:
-            logger.error(f"Error loading SentenceTransformer model: {str(e)}")
-            raise
+# Cosine Similarity (traditional)
+cosine_sim = 1 - distance.cosine(old_centroid, new_centroid)
 
-    def generate_embeddings(self, texts):
-        """
-        Generate embeddings using the SentenceTransformer model.
-        """
-        try:
-            embeddings = self.model.encode(texts, batch_size=256, show_progress_bar=False, normalize_embeddings=True)
-            return embeddings
-        except Exception as e:
-            logger.error(f"Error generating embeddings: {str(e)}")
-            raise
+# Euclidean Distance (traditional)
+euclidean_dist = np.linalg.norm(old_centroid - new_centroid)
 
-# -------------------------
-# 3. Chroma DB Setup with Persistence
-# -------------------------
-def setup_chroma_db(embedding_name="v1"):
-    save_path = f"./embeddings/{embedding_name}"
-    os.makedirs(save_path, exist_ok=True)
-    client = chromadb.PersistentClient(path=save_path)
-    embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction()
-    collection = client.get_or_create_collection(name="merchant_embeddings", embedding_function=embed_fn)
-    logger.info(f"Chroma DB initialized and will be saved in {save_path}.")
-    return collection
+# JSD (traditional)
+def jensen_shannon_divergence(p, q):
+    p = p / p.sum()
+    q = q / q.sum()
+    m = 0.5*(p+q)
+    return 0.5*entropy(p, m) + 0.5*entropy(q, m)
 
-def insert_to_chroma_db(collection, embeddings, metadata_list):
-    ids = [str(i) for i in range(len(metadata_list))]
-    collection.add(embeddings=embeddings.tolist(), metadatas=metadata_list, ids=ids)
-    logger.info(f"Inserted batch of {len(metadata_list)} embeddings into Chroma DB.")
+old_hist, bins = np.histogram(old_embeddings.flatten(), bins=50, density=True)
+new_hist, _ = np.histogram(new_embeddings.flatten(), bins=bins, density=True)
+jsd_value = jensen_shannon_divergence(old_hist, new_hist)
 
-# -------------------------
-# 4. Batch Processing with Multi-Processing
-# -------------------------
-def process_batch(batch, embedding_model, chroma_collection):
-    """
-    Function to process each batch: generate embeddings and store in Chroma DB.
-    """
-    start_time = time()
-    raw_names, metadata_list = zip(*batch)
-    embeddings = embedding_model.generate_embeddings(list(raw_names))
-    insert_to_chroma_db(chroma_collection, embeddings, metadata_list)
-    logger.info(f"Processed batch of {len(batch)} in {time() - start_time:.2f} seconds.")
+# KL Divergence (Symmetric)
+def safe_kl_div(p, q):
+    p = p / p.sum()
+    q = q / q.sum()
+    eps = 1e-10
+    return np.sum(p * np.log((p+eps)/(q+eps)))
 
-def process_data(file_path, embedding_model, chroma_collection, batch_size=1024, num_workers=4):
-    """
-    Process the entire dataset in batches with multiprocessing for embedding generation.
-    """
-    dataset = MerchantDataset(file_path)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+kl_old_new = safe_kl_div(old_hist, new_hist)
+kl_new_old = safe_kl_div(new_hist, old_hist)
+kl_sym = 0.5*(kl_old_new + kl_new_old)
 
-    logger.info("Starting batch processing with multi-processing.")
-    with ProcessPoolExecutor(max_workers=num_workers) as process_executor:
-        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Processing Batches", dynamic_ncols=True)):
-            process_executor.submit(process_batch, batch, embedding_model, chroma_collection)
+# Wasserstein Distance (traditional)
+old_vals = old_embeddings.flatten()
+new_vals = new_embeddings.flatten()
+w_distance = wasserstein_distance(old_vals, new_vals)
 
-# -------------------------
-# 5. Main Function
-# -------------------------
-def main():
-    try:
-        file_path = "path/to/your/data.csv"  # Replace with your CSV path
-        embedding_name = "v1"  # Embedding version name
+# Mahalanobis Distance (traditional)
+cov = np.cov(old_embeddings, rowvar=False)
+inv_cov = inv(cov + np.eye(cov.shape[0])*1e-10)
+diff = new_centroid - old_centroid
+mahalanobis_dist = np.sqrt(diff.T.dot(inv_cov).dot(diff))
 
-        # Initialize Embedding Model
-        embedding_model = EmbeddingModel(model_path="model/all-MiniLM-L6-v2")
+# Covariance Distance (traditional)
+new_cov = np.cov(new_embeddings, rowvar=False)
+cov_dist = np.linalg.norm(cov - new_cov, ord='fro')
 
-        # Setup Chroma DB with persistence
-        chroma_collection = setup_chroma_db(embedding_name)
+# PCA Shift (traditional)
+explained_variance_old = PCA(n_components=2).fit(old_embeddings).explained_variance_ratio_
+explained_variance_new = PCA(n_components=2).fit(new_embeddings).explained_variance_ratio_
+pca_shift = np.linalg.norm(explained_variance_old - explained_variance_new)
 
-        # Process Data
-        process_data(file_path, embedding_model, chroma_collection, batch_size=1024, num_workers=4)
+###############################################################################
+# Using Alibi Detect for a More Robust Drift Metric (MMD)
+###############################################################################
+# MMD Drift Detector: A robust method from alibi-detect for distribution drift.
+# We'll set up the detector using default RBF kernel parameters for demonstration.
+cd = MMDDrift(
+    x_ref=old_embeddings,  # reference data (old embeddings)
+    p_val=0.05,            # significance level
+    preprocess_x=None,     # no preprocessing needed
+    n_permutations=100,    # number of permutations for p-value estimation
+    chunk_size=None
+)
 
-        logger.info("All embeddings generated and stored successfully in Chroma DB.")
-    except Exception as e:
-        logger.critical(f"Critical error: {str(e)}")
-        raise
+# Test for drift
+mmd_result = cd.predict(new_embeddings)
+mmd_driftscore = mmd_result['data']['distance']
+mmd_pvalue = mmd_result['data']['p_val']
+mmd_is_drift = bool(mmd_result['data']['is_drift'])
 
-if __name__ == "__main__":
-    main()
+print(f"MMD Drift Score: {mmd_driftscore}")
+print(f"MMD p-value: {mmd_pvalue}")
+print(f"Is drift detected by MMD test? {'Yes' if mmd_is_drift else 'No'}")
+
+###############################################################################
+# Generate Evidently Report
+###############################################################################
+old_df_evidently = old_df.copy()
+new_df_evidently = new_df.copy()
+old_df_evidently["mrch_length"] = old_df_evidently["mrch_nm_raw"].apply(len)
+new_df_evidently["mrch_length"] = new_df_evidently["mrch_nm_raw"].apply(len)
+
+report = Report(metrics=[DataDriftPreset()])
+report.run(reference_data=old_df_evidently, current_data=new_df_evidently)
+report.save_html("data_drift_report.html")
+print("Evidently data drift report saved as data_drift_report.html")
+
+###############################################################################
+# Plotting / Visualization
+###############################################################################
+
+# 1. Histogram of Old vs New embedding distribution
+plt.figure(figsize=(10, 6))
+sns.histplot(old_vals, bins=50, color='blue', alpha=0.5, stat='density', label='Old')
+sns.histplot(new_vals, bins=50, color='red', alpha=0.5, stat='density', label='New')
+plt.title("Distribution of Flattened Embeddings")
+plt.xlabel("Embedding Value")
+plt.ylabel("Density")
+plt.legend()
+plt.show()
+
+# 2. PCA 2D Scatter Plot
+all_data = np.vstack([old_embeddings, new_embeddings])
+pca_2d = PCA(n_components=2).fit(all_data)
+old_2d = pca_2d.transform(old_embeddings)
+new_2d = pca_2d.transform(new_embeddings)
+
+plt.figure(figsize=(8, 6))
+plt.scatter(old_2d[:,0], old_2d[:,1], color='blue', alpha=0.7, label='Old Embeddings')
+plt.scatter(new_2d[:,0], new_2d[:,1], color='red', alpha=0.7, label='New Embeddings')
+plt.title("PCA Projection of Old vs New Embeddings")
+plt.xlabel("PC 1")
+plt.ylabel("PC 2")
+plt.legend()
+plt.show()
+
+# 3. Bar plot of traditional metrics
+metrics = {
+    "Cosine Similarity": cosine_sim,
+    "Euclidean Distance": euclidean_dist,
+    "JSD": jsd_value,
+    "Sym KL Div": kl_sym,
+    "Wasserstein": w_distance,
+    "Mahalanobis": mahalanobis_dist,
+    "Cov Dist": cov_dist,
+    "PCA Shift": pca_shift,
+    "MMD Drift Score": mmd_driftscore
+}
+
+plt.figure(figsize=(10, 6))
+sns.barplot(x=list(metrics.keys()), y=list(metrics.values()))
+plt.xticks(rotation=45, ha='right')
+plt.title("Drift Metrics Comparison (Including MMD)")
+plt.ylabel("Metric Value")
+plt.tight_layout()
+plt.show()
+
+# 4. UMAP Visualization
+umap_reducer = umap.UMAP(n_components=2, random_state=42)
+umap_embedding = umap_reducer.fit_transform(all_data)
+
+old_umap = umap_embedding[:len(old_embeddings)]
+new_umap = umap_embedding[len(old_embeddings):]
+
+plt.figure(figsize=(8, 6))
+plt.scatter(old_umap[:,0], old_umap[:,1], color='blue', alpha=0.7, label='Old Embeddings')
+plt.scatter(new_umap[:,0], new_umap[:,1], color='red', alpha=0.7, label='New Embeddings')
+plt.title("UMAP Projection of Old vs New Embeddings")
+plt.xlabel("UMAP 1")
+plt.ylabel("UMAP 2")
+plt.legend()
+plt.show()
