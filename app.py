@@ -49,25 +49,28 @@ class MerchantDataset(Dataset):
 # 2. Embedding Model Class with bfloat16 and BitsAndBytes
 # -------------------------
 class EmbeddingModel:
-    def __init__(self, model_name="nvidia/NV-Embed-v2"):
+    def __init__(self, model_path="model/all-MiniLM-L6-v2"):
         try:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
-            self.dtype = torch.bfloat16  # Use bfloat16
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.dtype = torch.bfloat16  # Use bfloat16 precision for better performance
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-            # Load model with bfloat16 precision using bitsandbytes
+            # Load model with bfloat16 precision and BitsAndBytes quantization
             self.model = AutoModel.from_pretrained(
-                model_name,
+                model_path,
                 torch_dtype=self.dtype,
                 load_in_8bit=True,  # BitsAndBytes quantization
                 device_map="auto"  # Automatically map to GPUs
             )
-            logger.info("Embedding model loaded successfully with bfloat16 precision and 8-bit quantization.")
+            logger.info(f"Embedding model loaded successfully from {model_path} with bfloat16 precision.")
         except Exception as e:
-            logger.error(f"Failed to load embedding model: {str(e)}")
+            logger.error(f"Failed to load embedding model from {model_path}: {str(e)}")
             raise
 
     def generate_embeddings(self, texts):
+        """
+        Generate embeddings for a batch of input texts.
+        """
         inputs = self.tokenizer(texts, padding=True, truncation=True, return_tensors="pt").to(self.device)
         with torch.no_grad():
             outputs = self.model(**inputs).last_hidden_state[:, 0, :]
