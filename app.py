@@ -1,4 +1,4 @@
-# pip install pandas numpy sentence-transformers chromadb sklearn scipy matplotlib seaborn evidently 
+# pip install pandas numpy sentence-transformers chromadb scikit-learn scipy matplotlib seaborn evidently 
 
 import pandas as pd
 import numpy as np
