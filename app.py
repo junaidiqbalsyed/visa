@@ -3,6 +3,269 @@
 
 
 import pandas as pd
+import math
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+import torch
+import torch.nn.functional as F
+from torch import tensor
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import Chroma
+from evidently.report import Report
+from evidently.metric_preset import DataDriftPreset
+from sklearn.manifold import TSNE
+from scipy.stats import ks_2samp
+from torch.linalg import inv as torch_inv, svd as torch_svd
+
+###############################################################################
+# Device Setup
+###############################################################################
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+###############################################################################
+# Sample Data (Replace with your own data loading code)
+###############################################################################
+df = pd.DataFrame({
+    "mrch_nm_raw": [
+        "SAFEWAY #2841",
+        "SHELL OIL 1000492406",
+        "SUNOCO 091017800",
+        "POPEYES 11562",
+        "TEXAS ROADHOUSE FR #7005",
+        "HARBOR FREIGHT TOOLS 233",
+        "COSTCO WHOLESALE",
+        "WALMART SUPERCENTER 1234",
+        "TARGET T-123",
+        "AMAZON MKTPLACE PMTS",
+        "MCDONALD'S F23987",
+        "BURGER KING #0081"
+    ]
+})
+
+mid = len(df) // 2
+old_df = df.iloc[:mid]
+new_df = df.iloc[mid:]
+
+old_texts = old_df["mrch_nm_raw"].tolist()
+new_texts = new_df["mrch_nm_raw"].tolist()
+
+###############################################################################
+# Embeddings Setup (Consider a smaller model if GPU memory is tight)
+###############################################################################
+embedding_fn = HuggingFaceEmbeddings(model_name='sentence-transformers/all-mpnet-base-v2')
+
+###############################################################################
+# Initialize Chroma Vector Store
+###############################################################################
+vectordb = Chroma(
+    collection_name="merchant_embeddings",
+    persist_directory="chroma_db",
+    embedding_function=embedding_fn
+)
+
+###############################################################################
+# Batch Insertion with GPU Embeddings
+###############################################################################
+def add_texts_in_batches(vdb, texts, batch_size=2000, sub_batch_size=256):
+    """
+    Add documents to Chroma in GPU-accelerated batches.
+    Adjust batch_size and sub_batch_size to fit GPU memory.
+    """
+    num_batches = math.ceil(len(texts) / batch_size)
+    all_embeddings = []
+
+    for i in range(num_batches):
+        start_idx = i * batch_size
+        end_idx = start_idx + batch_size
+        batch_texts = texts[start_idx:end_idx]
+
+        embeddings = []
+        with tqdm(total=len(batch_texts), desc=f"Embedding batch {i+1}/{num_batches}", unit="doc") as pbar:
+            for sb_start in range(0, len(batch_texts), sub_batch_size):
+                sb_end = sb_start + sub_batch_size
+                sub_batch_texts = batch_texts[sb_start:sb_end]
+                # embed_documents returns a list of np arrays
+                sub_embeddings = embedding_fn.embed_documents(sub_batch_texts)
+                # Convert to torch and move to device
+                sub_embeddings = torch.tensor(sub_embeddings, device=device, dtype=torch.float32)
+                embeddings.append(sub_embeddings)
+                pbar.update(len(sub_batch_texts))
+        embeddings = torch.cat(embeddings, dim=0)
+
+        # Move embeddings back to CPU for Chroma insertion
+        # Chroma expects lists of embeddings on CPU
+        embeddings_cpu = embeddings.cpu().numpy()
+        with tqdm(total=1, desc=f"Adding batch {i+1}/{num_batches} to Chroma", unit="batch") as pbar_add:
+            vdb.add_texts(texts=batch_texts, embeddings=embeddings_cpu)
+            pbar_add.update(1)
+
+        all_embeddings.append(embeddings)
+
+    if all_embeddings:
+        return torch.cat(all_embeddings, dim=0)
+    else:
+        # Empty case
+        return torch.empty((0, embedding_fn.client.get_sentence_embedding_dimension()), device=device)
+
+###############################################################################
+# Add Old and New Data and Retrieve Embeddings
+###############################################################################
+old_embeddings = add_texts_in_batches(vectordb, old_texts, batch_size=2000, sub_batch_size=256)
+new_embeddings = add_texts_in_batches(vectordb, new_texts, batch_size=2000, sub_batch_size=256)
+
+vectordb.persist()
+print("Chroma DB persistence done.")
+
+###############################################################################
+# Metric Computations on GPU with Torch
+###############################################################################
+# Compute centroids
+old_centroid = old_embeddings.mean(dim=0)
+new_centroid = new_embeddings.mean(dim=0)
+
+# Cosine Similarity
+cosine_sim = F.cosine_similarity(old_centroid, new_centroid, dim=0).item()
+
+# Euclidean Distance
+euclidean_dist = torch.norm(old_centroid - new_centroid).item()
+
+# Histogram-based metrics: use torch.histc
+all_vals = torch.cat([old_embeddings, new_embeddings], dim=0).flatten()
+val_min = torch.min(all_vals)
+val_max = torch.max(all_vals)
+
+bins = 50
+old_hist = torch.histc(old_embeddings.flatten(), bins=bins, min=val_min.item(), max=val_max.item())
+new_hist = torch.histc(new_embeddings.flatten(), bins=bins, min=val_min.item(), max=val_max.item())
+
+# Normalize hist to get probability distribution
+old_hist = old_hist / old_hist.sum()
+new_hist = new_hist / new_hist.sum()
+
+def kl_div(p, q):
+    eps = 1e-10
+    p_ = p + eps
+    q_ = q + eps
+    return torch.sum(p_ * torch.log(p_ / q_))
+
+def jsd(p, q):
+    m = 0.5 * (p + q)
+    return 0.5 * kl_div(p, m) + 0.5 * kl_div(q, m)
+
+jsd_value = jsd(old_hist, new_hist).item()
+
+kl_old_new = kl_div(old_hist, new_hist).item()
+kl_new_old = kl_div(new_hist, old_hist).item()
+kl_sym = 0.5*(kl_old_new + kl_new_old)
+
+# Wasserstein Distance: 
+# For wasserstein_distance, we can approximate using CPU scipy since it’s a one-liner.
+# If we want GPU version, we must implement it. Let's just move back to CPU.
+old_vals_cpu = old_embeddings.flatten().cpu().numpy()
+new_vals_cpu = new_embeddings.flatten().cpu().numpy()
+w_distance = wasserstein_distance(old_vals_cpu, new_vals_cpu)
+
+# Mahalanobis Distance
+# Compute covariance on GPU
+# torch.cov requires at least PyTorch 1.9+
+cov_old = torch.cov(old_embeddings.T)
+inv_cov = torch_inv(cov_old + torch.eye(cov_old.shape[0], device=device)*1e-10)
+diff = new_centroid - old_centroid
+mahalanobis_dist = torch.sqrt(diff @ inv_cov @ diff).item()
+
+# Covariance Distance (Frobenius norm on GPU)
+cov_new = torch.cov(new_embeddings.T)
+cov_dist = torch.norm(cov_old - cov_new, p='fro').item()
+
+# PCA Shift using SVD on GPU
+def pca_variance_ratio(x, n_components=2):
+    x_centered = x - x.mean(dim=0)
+    U,S,Vt = torch_svd(x_centered, full_matrices=False)
+    explained_variance = (S**2)/(x.shape[0]-1)
+    evr = explained_variance / explained_variance.sum()
+    return evr[:n_components]
+
+explained_variance_old = pca_variance_ratio(old_embeddings)
+explained_variance_new = pca_variance_ratio(new_embeddings)
+pca_shift = torch.norm(explained_variance_old - explained_variance_new).item()
+
+# KS Test on CPU
+ks_statistic, ks_pvalue = ks_2samp(old_vals_cpu, new_vals_cpu)
+
+###############################################################################
+# Evidently Report (CPU)
+###############################################################################
+old_df_evidently = old_df.copy()
+new_df_evidently = new_df.copy()
+old_df_evidently["mrch_length"] = old_df_evidently["mrch_nm_raw"].apply(len)
+new_df_evidently["mrch_length"] = new_df_evidently["mrch_nm_raw"].apply(len)
+
+report = Report(metrics=[DataDriftPreset()])
+report.run(reference_data=old_df_evidently, current_data=new_df_evidently)
+report.save_html("data_drift_report.html")
+print("Evidently data drift report saved as data_drift_report.html")
+
+###############################################################################
+# Visualizations (CPU)
+###############################################################################
+import numpy as np
+# Histogram of Old vs New
+old_vals_cpu = old_vals_cpu  # already on CPU
+new_vals_cpu = new_vals_cpu
+
+plt.figure(figsize=(10, 6))
+sns.histplot(old_vals_cpu, bins=50, color='blue', alpha=0.5, stat='density', label='Old')
+sns.histplot(new_vals_cpu, bins=50, color='red', alpha=0.5, stat='density', label='New')
+plt.title("Distribution of Flattened Embeddings")
+plt.xlabel("Embedding Value")
+plt.ylabel("Density")
+plt.legend()
+plt.show()
+
+# t-SNE Visualization (CPU)
+all_data_cpu = torch.cat([old_embeddings, new_embeddings], dim=0).cpu().numpy()
+tsne = TSNE(n_components=2, random_state=42, perplexity=30, init='random', verbose=1)
+tsne_embedding = tsne.fit_transform(all_data_cpu)
+old_tsne = tsne_embedding[:len(old_embeddings)]
+new_tsne = tsne_embedding[len(old_embeddings):]
+
+plt.figure(figsize=(8, 6))
+plt.scatter(old_tsne[:,0], old_tsne[:,1], color='blue', alpha=0.7, label='Old Embeddings')
+plt.scatter(new_tsne[:,0], new_tsne[:,1], color='red', alpha=0.7, label='New Embeddings')
+plt.title("t-SNE Projection of Old vs New Embeddings")
+plt.xlabel("t-SNE 1")
+plt.ylabel("t-SNE 2")
+plt.legend()
+plt.show()
+
+# Bar plot of Metrics
+metrics = {
+    "Cosine Similarity": cosine_sim,
+    "Euclidean Distance": euclidean_dist,
+    "JSD": jsd_value,
+    "Sym KL Div": kl_sym,
+    "Wasserstein": w_distance,
+    "Mahalanobis": mahalanobis_dist,
+    "Cov Dist": cov_dist,
+    "PCA Shift": pca_shift,
+    "KS Statistic": ks_statistic,
+    "KS p-value": ks_pvalue
+}
+
+plt.figure(figsize=(10, 6))
+sns.barplot(x=list(metrics.keys()), y=list(metrics.values()))
+plt.xticks(rotation=45, ha='right')
+plt.title("Drift Metrics Comparison")
+plt.ylabel("Metric Value")
+plt.tight_layout()
+plt.show()
+
+
+###########################################################################################################
+
+import pandas as pd
 import numpy as np
 import math
 from tqdm import tqdm
