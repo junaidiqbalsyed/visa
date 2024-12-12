@@ -1,0 +1,19 @@
+SELECT 
+    acqr_bin_usr_bus_id, 
+    crd_acptr_id_raw,
+    collect_set(CASE WHEN cpd_dt BETWEEN '20240101' AND '20240107' THEN mrch_nm_raw END) AS january_merchants,
+    collect_set(CASE WHEN cpd_dt BETWEEN '20240401' AND '20240407' THEN mrch_nm_raw END) AS april_merchants,
+    collect_set(CASE WHEN cpd_dt BETWEEN '20240601' AND '20240607' THEN mrch_nm_raw END) AS june_merchants,
+    collect_set(CASE WHEN cpd_dt BETWEEN '20241001' AND '20241007' THEN mrch_nm_raw END) AS october_merchants
+FROM gmr.tp_m_cs_agg
+WHERE 
+    (cpd_dt BETWEEN '20240101' AND '20240107')
+    OR (cpd_dt BETWEEN '20240401' AND '20240407')
+    OR (cpd_dt BETWEEN '20240601' AND '20240607')
+    OR (cpd_dt BETWEEN '20241001' AND '20241007')
+GROUP BY 
+    acqr_bin_usr_bus_id, 
+    crd_acptr_id_raw
+ORDER BY 
+    acqr_bin_usr_bus_id, 
+    crd_acptr_id_raw;
